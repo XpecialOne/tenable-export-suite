@@ -14,6 +14,28 @@ The script wraps the Tenable asynchronous export APIs, flattens the NDJSON outpu
 
 ---
 
+## Quick Start
+
+```bash
+git clone <your-repo-url>.git
+cd tenable-export-suite-v2
+
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
+cp .env.example .env               # fill with your Tenable API keys
+
+python Tenable_Export_Suite.py -o excel parquet duckdb
+```
+
+For detailed usage, configuration, Power BI integration and examples, read:
+
+- [`README.md`](./README.md)
+- [`EXAMPLES.md`](./EXAMPLES.md)
+- [`POWERBI_MODEL.md`](./POWERBI_MODEL.md)
+
+
 ## Table of contents
 
 1. [Overview](#overview)  
