@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# TES specific
+.env
+exports/
+logs/
+*.log
+*.duckdb
+*.parquet
+*.xlsx

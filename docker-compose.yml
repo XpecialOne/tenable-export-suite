@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  tes:
+    build: .
+    container_name: tes_v2
+    environment:
+      - TENABLE_ACCESS_KEY=${TENABLE_ACCESS_KEY}
+      - TENABLE_SECRET_KEY=${TENABLE_SECRET_KEY}
+      - TENABLE_API_URL=${TENABLE_API_URL:-https://cloud.tenable.com}
+    volumes:
+      - ./exports:/app/exports
+      - ./logs:/app/logs
+    command: ["python", "Tenable_Export_Suite.py", "-o", "parquet", "duckdb", "--output-dir", "/app/exports"]
