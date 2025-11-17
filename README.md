@@ -1,5 +1,9 @@
 # Tenable Export Suite v2 (TES)
 
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)]()
+[![Status](https://img.shields.io/badge/status-beta-orange.svg)]()
+
 Export **Tenable.io VM vulnerabilities, WAS findings and VM assets** into analytics-friendly formats (Excel, Parquet, DuckDB) in a single run.
 
 This project contains a single script:
