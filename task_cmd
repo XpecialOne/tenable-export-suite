@@ -1,0 +1,2 @@
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\schedule_tes_task.patched.ps1 -TesDirectory "C:\tes" -ExportDir "C:\Users\<YOU>\OneDrive - <ORG>\Shared Documents\TenableExports" -RunAt "08:00"
