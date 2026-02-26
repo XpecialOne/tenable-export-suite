@@ -62,17 +62,21 @@ RETRY_BACKOFF  = 10     # seconds to wait before first retry (doubles each attem
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-def post(endpoint: str, payload: dict = None) -> dict:
+def post(endpoint: str, payload: dict = None, params: dict = None) -> dict:
     """
     POST with retry logic for 429 / 5xx and consistent error handling.
     Never logs response bodies to avoid leaking sensitive data.
+
+    Per Tenable WAS v2 API design:
+      - POST body   = filter expression (field/operator/value or AND/OR)
+      - Query params = pagination (limit, offset)
     """
     url   = f"{BASE_URL}{endpoint}"
     delay = RETRY_BACKOFF
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            r = requests.post(url, headers=HEADERS, json=payload or {}, timeout=30)
+            r = requests.post(url, headers=HEADERS, json=payload or {}, params=params, timeout=30)
         except requests.exceptions.SSLError:
             print(f"[ERROR] SSL verification failed for {endpoint}. Aborting.")
             sys.exit(1)
@@ -126,24 +130,28 @@ def post(endpoint: str, payload: dict = None) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_all_was_configs() -> list:
     """
-    POST /was/v2/configs/search
-    Paginates using 'offset' and 'limit' in the request body.
-    Response: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
-    Each item contains a nested "last_scan" object with status/timing — no per-scan API call needed.
+    POST /was/v2/configs/search?limit=N&offset=N
+    Per Tenable WAS v2 API design, the POST body is the filter expression and
+    pagination is controlled via query parameters — identical to the GET pattern.
+
+    Sending pagination in the body was silently treated as an invalid filter,
+    causing the API to return only configs with a completed last_scan by default.
 
     NOTE: The API may return fewer items than 'limit' on every page regardless
     of what is requested. Break conditions are therefore based solely on the
-    authoritative 'total' field from pagination, never on page size.
+    authoritative 'total' field from the pagination object, never on page size.
     """
     all_configs = []
     offset      = 0
-    limit       = 100   # requested page size; API may silently cap this lower
+    limit       = 100   # requested page size; API may silently cap lower
     total       = None  # populated after the first response
 
     print("[*] Fetching WAS scan configurations...")
 
     while True:
-        data  = post("/was/v2/configs/search", {"offset": offset, "limit": limit})
+        data  = post("/was/v2/configs/search",
+                     payload=None,                        # no filter = return everything
+                     params={"limit": limit, "offset": offset})
         items = data.get("items", [])
 
         if total is None:
@@ -163,6 +171,20 @@ def fetch_all_was_configs() -> list:
 
     return all_configs
 
+
+
+def fetch_current_scan(config_id: str) -> dict:
+    """
+    POST /was/v2/configs/{config_id}/scans/search
+    Returns the absolute latest scan for a given config, sorted by created_at desc.
+    Used only when the embedded last_scan is absent or in a terminal state that may
+    not reflect a currently running/queued scan.
+    """
+    data  = post(f"/was/v2/configs/{config_id}/scans/search",
+                 payload=None,
+                 params={"limit": 1, "sort": "created_at:desc"})
+    items = data.get("items", [])
+    return items[0] if items else {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,7 +465,16 @@ def main():
         notes     = config.get("description") or ""       # API returns null, not ""
         target    = config.get("target") or "N/A"         # plain string at top level
 
-        last_scan = config.get("last_scan") or {}         # already embedded in response
+        # The embedded last_scan reflects the last *terminal* scan.
+        # For configs with no scan history or a currently active scan, fetch live status.
+        TERMINAL = {"completed", "error", "aborted"}
+        last_scan      = config.get("last_scan") or {}
+        embedded_status = (last_scan.get("status") or "").lower()
+
+        if not last_scan or embedded_status not in TERMINAL:
+            # No embedded scan, or it may be stale (running/queued) — fetch live
+            last_scan = fetch_current_scan(config_id) or last_scan
+
         if last_scan:
             status   = normalise_status(last_scan.get("status", ""))
             last_run = fmt_ts(last_scan.get("started_at") or last_scan.get("finalized_at"))
