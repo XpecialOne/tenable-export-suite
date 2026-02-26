@@ -129,24 +129,36 @@ def fetch_all_was_configs() -> list:
     POST /was/v2/configs/search
     Paginates using 'offset' and 'limit' in the request body.
     Response: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
+
+    NOTE: The API may return fewer items than 'limit' on every page regardless
+    of what is requested. Break conditions are therefore based solely on the
+    authoritative 'total' field from pagination, never on page size.
     """
-    all_configs, offset, limit = [], 0, 100
+    all_configs = []
+    offset      = 0
+    limit       = 100   # requested page size; API may silently cap this lower
+    total       = None  # populated after the first response
+
     print("[*] Fetching WAS scan configurations...")
 
     while True:
         data  = post("/was/v2/configs/search", {"offset": offset, "limit": limit})
         items = data.get("items", [])
-        total = data.get("pagination", {}).get("total", len(all_configs) + len(items))
 
-        if not items:
+        if total is None:
+            total = data.get("pagination", {}).get("total", 0)
+            print(f"    API reports {total} total configurations")
+
+        if not items and not total:
             break
 
         all_configs.extend(items)
         print(f"    {len(all_configs)} / {total} fetched")
 
-        if len(all_configs) >= total or len(items) < limit:
+        if not items or len(all_configs) >= total:
             break
-        offset += limit
+
+        offset += len(items)   # advance by actual items returned, not assumed limit
 
     return all_configs
 
