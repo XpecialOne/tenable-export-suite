@@ -11,80 +11,115 @@ Usage:
     Then run:
         python tenable_was_scan_status.py
 
-Output: was_scan_status.xlsx
+Output: was_scan_status.xlsx  (written next to this script)
 Requires: pip install openpyxl requests python-dotenv
 """
 
 import os
 import sys
+import time
 import requests
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Always resolve .env relative to this script's directory
-_env_path = Path(__file__).parent / ".env"
+from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).parent
+
+_env_path = _SCRIPT_DIR / ".env"
 if not _env_path.exists():
     print(f"[ERROR] .env file not found at: {_env_path}")
     sys.exit(1)
 load_dotenv(dotenv_path=_env_path)
 
-from openpyxl import Workbook
-from openpyxl.styles import (
-    Font, PatternFill, Alignment, Border, Side, GradientFill
-)
-from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, Reference
-from openpyxl.chart.label import DataLabelList
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
 ACCESS_KEY  = os.environ.get("TENABLE_ACCESS_KEY", "")
 SECRET_KEY  = os.environ.get("TENABLE_SECRET_KEY", "")
-OUTPUT_FILE = "was_scan_status.xlsx"
+OUTPUT_FILE = _SCRIPT_DIR / "was_scan_status.xlsx"  # always written next to the script
 
 if not ACCESS_KEY or not SECRET_KEY:
     print("[ERROR] Missing API credentials.")
-    print("  Ensure a .env file exists in the same directory containing:")
+    print("  Ensure your .env file contains:")
     print("    TENABLE_ACCESS_KEY=your_access_key")
     print("    TENABLE_SECRET_KEY=your_secret_key")
     sys.exit(1)
 
-BASE_URL = "https://cloud.tenable.com"
-HEADERS  = {
-    "X-ApiKeys": f"accessKey={ACCESS_KEY}; secretKey={SECRET_KEY}",
-    "Accept"   : "application/json",
+BASE_URL       = "https://cloud.tenable.com"
+HEADERS        = {
+    "X-ApiKeys"   : f"accessKey={ACCESS_KEY}; secretKey={SECRET_KEY}",
+    "Accept"      : "application/json",
+    "Content-Type": "application/json",
 }
+RETRY_ATTEMPTS = 3      # retries on 429 / 5xx
+RETRY_BACKOFF  = 10     # seconds to wait before first retry (doubles each attempt)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-def get(endpoint: str, params: dict = None) -> dict:
-    url = f"{BASE_URL}{endpoint}"
-    try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=30)
-    except requests.exceptions.SSLError:
-        print(f"[ERROR] SSL verification failed for {endpoint}. Aborting.")
-        sys.exit(1)
-    except requests.exceptions.ConnectionError:
-        print(f"[ERROR] Could not reach {BASE_URL}. Check network connectivity.")
-        sys.exit(1)
-    except requests.exceptions.Timeout:
-        print(f"[WARN] Request timed out for {endpoint}. Skipping.")
-        return {}
+def post(endpoint: str, payload: dict = None) -> dict:
+    """
+    POST with retry logic for 429 / 5xx and consistent error handling.
+    Never logs response bodies to avoid leaking sensitive data.
+    """
+    url   = f"{BASE_URL}{endpoint}"
+    delay = RETRY_BACKOFF
 
-    if r.status_code == 401:
-        print("[ERROR] Authentication failed (HTTP 401). Verify your API keys.")
-        sys.exit(1)
-    if r.status_code == 403:
-        print(f"[WARN] Access denied (HTTP 403) for {endpoint}. Check permissions.")
-        return {}
-    if not r.ok:
-        print(f"[WARN] {endpoint} returned HTTP {r.status_code}. Skipping.")
-        return {}
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.post(url, headers=HEADERS, json=payload or {}, timeout=30)
+        except requests.exceptions.SSLError:
+            print(f"[ERROR] SSL verification failed for {endpoint}. Aborting.")
+            sys.exit(1)
+        except requests.exceptions.ConnectionError:
+            print(f"[ERROR] Could not reach {BASE_URL}. Check network connectivity.")
+            sys.exit(1)
+        except requests.exceptions.Timeout:
+            print(f"[WARN] Request timed out for {endpoint} (attempt {attempt}/{RETRY_ATTEMPTS}).")
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return {}
 
-    return r.json()
+        if r.status_code == 401:
+            print("[ERROR] Authentication failed (HTTP 401). Verify your API keys.")
+            sys.exit(1)
+        if r.status_code == 403:
+            print(f"[WARN] Access denied (HTTP 403) for {endpoint}. Check API key permissions.")
+            return {}
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", delay))
+            print(f"[WARN] Rate limited (HTTP 429). Waiting {retry_after}s before retry "
+                  f"(attempt {attempt}/{RETRY_ATTEMPTS})...")
+            time.sleep(retry_after)
+            delay *= 2
+            continue
+        if r.status_code >= 500:
+            print(f"[WARN] Server error HTTP {r.status_code} for {endpoint} "
+                  f"(attempt {attempt}/{RETRY_ATTEMPTS}).")
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return {}
+        if not r.ok:
+            print(f"[WARN] POST {endpoint} returned HTTP {r.status_code}. Skipping.")
+            return {}
+
+        try:
+            return r.json()
+        except ValueError:
+            # Catches json.JSONDecodeError on all requests versions (pre-2.28 and post)
+            print(f"[WARN] POST {endpoint} returned a non-JSON response. Skipping.")
+            return {}
+
+    return {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TENABLE WAS API
@@ -93,31 +128,15 @@ def fetch_all_was_configs() -> list:
     """
     POST /was/v2/configs/search
     Paginates using 'offset' and 'limit' in the request body.
-    Response shape: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
+    Response: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
     """
     all_configs, offset, limit = [], 0, 100
     print("[*] Fetching WAS scan configurations...")
 
     while True:
-        payload = {"offset": offset, "limit": limit}
-        r = requests.post(
-            f"{BASE_URL}/was/v2/configs/search",
-            headers=HEADERS,
-            json=payload,
-            timeout=30,
-        )
-
-        if r.status_code == 401:
-            print("[ERROR] Authentication failed (HTTP 401). Verify your API keys.")
-            sys.exit(1)
-        if not r.ok:
-            print(f"[ERROR] POST /was/v2/configs/search returned HTTP {r.status_code}. Aborting.")
-            sys.exit(1)
-
-        data  = r.json()
+        data  = post("/was/v2/configs/search", {"offset": offset, "limit": limit})
         items = data.get("items", [])
-        pagination = data.get("pagination", {})
-        total = pagination.get("total", len(all_configs) + len(items))
+        total = data.get("pagination", {}).get("total", len(all_configs) + len(items))
 
         if not items:
             break
@@ -135,44 +154,44 @@ def fetch_all_was_configs() -> list:
 def fetch_last_scan(config_id: str) -> dict:
     """
     POST /was/v2/scans/search
-    Filter by config_id, return only the most recent scan.
+    Returns the most recent scan execution for the given config_id.
     """
+    if not config_id:
+        return {}
+
     payload = {
         "filter": {
-            "and": [
-                {"field": "config_id", "operator": "eq", "value": config_id}
-            ]
+            "and": [{"field": "config_id", "operator": "eq", "value": config_id}]
         },
-        "sort": [{"field": "started_at", "order": "desc"}],
-        "limit": 1,
+        "sort"  : [{"field": "started_at", "order": "desc"}],
+        "limit" : 1,
         "offset": 0,
     }
-    r = requests.post(
-        f"{BASE_URL}/was/v2/scans/search",
-        headers=HEADERS,
-        json=payload,
-        timeout=30,
-    )
-    if not r.ok:
-        return {}
-    items = r.json().get("items", [])
+    data  = post("/was/v2/scans/search", payload)
+    items = data.get("items", [])
     return items[0] if items else {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 def fmt_ts(ts) -> str:
+    """Convert epoch seconds or ISO 8601 string to a readable UTC timestamp."""
     if not ts:
         return "N/A"
+    fmt = "%Y-%m-%d %H:%M:%S UTC"
     try:
         if isinstance(ts, (int, float)):
-            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        return str(ts)
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(fmt)
+        # ISO 8601 string — e.g. "2025-01-15T10:30:00.000Z" or "2025-01-15T10:30:00+00:00"
+        # Replace trailing Z only (Python < 3.11 fromisoformat does not accept Z suffix)
+        ts_str = ts if not str(ts).endswith("Z") else str(ts)[:-1] + "+00:00"
+        return datetime.fromisoformat(ts_str).astimezone(timezone.utc).strftime(fmt)
     except Exception:
-        return str(ts)
+        return str(ts)  # return raw value rather than crash
 
 
 def extract_urls(config: dict) -> str:
+    """Extract target URLs from a WAS scan config's settings block."""
     s    = config.get("settings", {})
     urls = s.get("urls") or s.get("target_urls") or [s.get("url") or s.get("start_url")]
     flat = []
@@ -181,71 +200,74 @@ def extract_urls(config: dict) -> str:
             flat.append(item.get("url", ""))
         elif item:
             flat.append(str(item))
-    return "\n".join(flat) if flat else "N/A"
+    return "\n".join(filter(None, flat)) or "N/A"
 
 
 def normalise_status(status: str) -> str:
     """Map raw API status values to consistent display labels."""
     mapping = {
-        "completed"  : "Completed",
-        "running"    : "Running",
-        "error"      : "Error",
-        "aborted"    : "Aborted",
-        "never_run"  : "Never Run",
-        "queued"     : "Queued",
-        "paused"     : "Paused",
-        "stopping"   : "Stopping",
+        ""         : "Unknown",
+        "completed": "Completed",
+        "running"  : "Running",
+        "error"    : "Error",
+        "aborted"  : "Aborted",
+        "never_run": "Never Run",
+        "queued"   : "Queued",
+        "paused"   : "Paused",
+        "stopping" : "Stopping",
     }
-    return mapping.get(status.lower().replace(" ", "_"), status.title())
+    return mapping.get(status.lower().replace(" ", "_"), status.title() or "Unknown")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STYLE CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+NAVY       = "1F4E79"
+DARK_NAVY  = "17375E"
+MID_BLUE   = "2E75B6"
+LIGHT_BLUE = "D6E4F0"
+WHITE      = "FFFFFF"
+LIGHT_GREY = "F2F2F2"
+MID_GREY   = "BFBFBF"
+DARK_GREY  = "595959"
+
+STATUS_BG = {
+    "Completed": "C6EFCE",
+    "Running"  : "FFEB9C",
+    "Error"    : "FFC7CE",
+    "Aborted"  : "FFC7CE",
+    "Never Run": "EDEDED",
+    "Queued"   : "DDEBF7",
+    "Paused"   : "FCE4D6",
+    "Stopping" : "FFEB9C",
+    "Unknown"  : "EDEDED",
+}
+STATUS_FG = {
+    "Completed": "276221",
+    "Running"  : "7D6608",
+    "Error"    : "9C0006",
+    "Aborted"  : "9C0006",
+    "Never Run": "595959",
+    "Queued"   : "1F4E79",
+    "Paused"   : "843C0C",
+    "Stopping" : "7D6608",
+    "Unknown"  : "595959",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STYLE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-# Palette
-NAVY        = "1F4E79"
-DARK_NAVY   = "17375E"
-MID_BLUE    = "2E75B6"
-LIGHT_BLUE  = "D6E4F0"
-WHITE       = "FFFFFF"
-LIGHT_GREY  = "F2F2F2"
-MID_GREY    = "BFBFBF"
-DARK_GREY   = "595959"
-
-STATUS_BG = {
-    "Completed" : "C6EFCE",
-    "Running"   : "FFEB9C",
-    "Error"     : "FFC7CE",
-    "Aborted"   : "FFC7CE",
-    "Never Run" : "EDEDED",
-    "Queued"    : "DDEBF7",
-    "Paused"    : "FCE4D6",
-    "Stopping"  : "FFEB9C",
-}
-STATUS_FG = {
-    "Completed" : "276221",
-    "Running"   : "7D6608",
-    "Error"     : "9C0006",
-    "Aborted"   : "9C0006",
-    "Never Run" : "595959",
-    "Queued"    : "1F4E79",
-    "Paused"    : "843C0C",
-    "Stopping"  : "7D6608",
-}
-
 def fill(colour: str) -> PatternFill:
     return PatternFill("solid", start_color=colour, fgColor=colour)
 
-def border(colour: str = MID_GREY, style: str = "thin") -> Border:
-    s = Side(style=style, color=colour)
+def border(colour: str = MID_GREY) -> Border:
+    s = Side(style="thin", color=colour)
     return Border(left=s, right=s, top=s, bottom=s)
 
 def bottom_border(colour: str = MID_GREY) -> Border:
-    s = Side(style="thin", color=colour)
-    return Border(bottom=s)
+    return Border(bottom=Side(style="thin", color=colour))
 
 def font(bold=False, size=10, colour=None, name="Arial", italic=False) -> Font:
-    return Font(name=name, bold=bold, size=size,
-                color=colour or "000000", italic=italic)
+    return Font(name=name, bold=bold, size=size, color=colour or "000000", italic=italic)
 
 def align(h="left", v="center", wrap=False) -> Alignment:
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
@@ -253,143 +275,109 @@ def align(h="left", v="center", wrap=False) -> Alignment:
 # ─────────────────────────────────────────────────────────────────────────────
 # SHEET 1 — EXECUTIVE SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
-EXTRACT_SHEET = "WAS Full Extract"   # referenced by formulas in summary sheet
+EXTRACT_SHEET = "WAS Full Extract"
 
 def build_summary_sheet(ws, rows: list, generated_at: str) -> None:
     ws.sheet_view.showGridLines = False
-    ws.column_dimensions["A"].width = 3    # left margin
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 18
-    ws.column_dimensions["E"].width = 18
-    ws.column_dimensions["F"].width = 18
-    ws.column_dimensions["G"].width = 3    # right margin
+
+    # Column layout: A = left margin, B–F = content, G = right margin
+    for col, width in [("A", 3), ("B", 24), ("C", 18), ("D", 18), ("E", 18), ("F", 18), ("G", 3)]:
+        ws.column_dimensions[col].width = width
 
     # ── Banner ────────────────────────────────────────────────────────────────
-    ws.row_dimensions[1].height = 8    # top padding
-    ws.row_dimensions[2].height = 45
-    ws.row_dimensions[3].height = 20
-    ws.row_dimensions[4].height = 12   # spacer
+    for row, height in [(1, 8), (2, 45), (3, 20), (4, 12)]:
+        ws.row_dimensions[row].height = height
 
     ws.merge_cells("B2:F2")
-    title_cell = ws["B2"]
-    title_cell.value     = "WAS Scan Status — Executive Summary"
-    title_cell.font      = font(bold=True, size=18, colour=WHITE)
-    title_cell.fill      = fill(NAVY)
-    title_cell.alignment = align("left", "center")
+    ws["B2"].value     = "WAS Scan Status — Executive Summary"
+    ws["B2"].font      = font(bold=True, size=18, colour=WHITE)
+    ws["B2"].fill      = fill(NAVY)
+    ws["B2"].alignment = align("left", "center")
 
     ws.merge_cells("B3:F3")
-    sub_cell = ws["B3"]
-    sub_cell.value     = f"Tenable Vulnerability Management  ·  Generated: {generated_at}"
-    sub_cell.font      = font(size=10, colour=WHITE, italic=True)
-    sub_cell.fill      = fill(DARK_NAVY)
-    sub_cell.alignment = align("left", "center")
+    ws["B3"].value     = f"Tenable Vulnerability Management  ·  Generated: {generated_at}"
+    ws["B3"].font      = font(size=10, colour=WHITE, italic=True)
+    ws["B3"].fill      = fill(DARK_NAVY)
+    ws["B3"].alignment = align("left", "center")
 
-    # Fill margin cells in banner rows
-    for row in [2, 3]:
-        for col in ["A", "G"]:
-            ws[f"{col}{row}"].fill = fill(NAVY if row == 2 else DARK_NAVY)
+    for row_num, bg in [(2, NAVY), (3, DARK_NAVY)]:
+        for col in ("A", "G"):
+            ws[f"{col}{row_num}"].fill = fill(bg)
 
-    # ── KPI tiles (row 5-7) ───────────────────────────────────────────────────
-    ws.row_dimensions[5].height = 14
-    ws.row_dimensions[6].height = 36
-    ws.row_dimensions[7].height = 22
-    ws.row_dimensions[8].height = 12   # spacer
+    # ── KPI Tiles (rows 5–7) ──────────────────────────────────────────────────
+    for row, height in [(5, 14), (6, 36), (7, 22), (8, 12)]:
+        ws.row_dimensions[row].height = height
 
-    n = len(rows)
-
-    # Count statuses in Python for tile values (formulas used below for live sheet)
-    from collections import Counter
+    n             = len(rows)
     status_counts = Counter(r["Status"] for r in rows)
 
     tiles = [
-        ("Total Scans",  n,                          MID_BLUE,  WHITE),
-        ("Completed",    status_counts.get("Completed", 0),   "217346", WHITE),
-        ("Running",      status_counts.get("Running", 0),     "BF8F00", "3D3D3D"),
-        ("Error / Abort",status_counts.get("Error", 0) +
-                         status_counts.get("Aborted", 0),    "C00000", WHITE),
-        ("Never Run",    status_counts.get("Never Run", 0),  DARK_GREY, WHITE),
+        ("Total Scans",   n,                                               MID_BLUE,  WHITE),
+        ("Completed",     status_counts.get("Completed", 0),               "217346",  WHITE),
+        ("Running",       status_counts.get("Running", 0),                 "BF8F00",  "3D3D3D"),
+        ("Error / Abort", status_counts.get("Error", 0) +
+                          status_counts.get("Aborted", 0),                 "C00000",  WHITE),
+        ("Never Run",     status_counts.get("Never Run", 0),               DARK_GREY, WHITE),
     ]
 
-    tile_cols = ["B", "C", "D", "E", "F"]
-    for col_letter, (label, value, bg, fg) in zip(tile_cols, tiles):
-        # Label row
-        lc = ws[f"{col_letter}5"]
-        lc.value     = label
-        lc.font      = font(bold=False, size=9, colour=fg)
-        lc.fill      = fill(bg)
-        lc.alignment = align("center", "bottom")
+    for col_letter, (label, value, bg, fg) in zip(["B", "C", "D", "E", "F"], tiles):
+        for row_num, val, bold, size in [(5, label, False, 9), (6, value, True, 22), (7, "", False, 9)]:
+            c           = ws[f"{col_letter}{row_num}"]
+            c.value     = val
+            c.font      = font(bold=bold, size=size, colour=fg)
+            c.fill      = fill(bg)
+            c.alignment = align("center", "center" if row_num == 6 else "bottom")
 
-        # Value row
-        vc = ws[f"{col_letter}6"]
-        vc.value     = value
-        vc.font      = font(bold=True, size=22, colour=fg)
-        vc.fill      = fill(bg)
-        vc.alignment = align("center", "center")
+    # ── Status Breakdown Table (rows 9+) ──────────────────────────────────────
+    for row, height in [(9, 20), (10, 18)]:
+        ws.row_dimensions[row].height = height
 
-        # Bottom accent
-        bc = ws[f"{col_letter}7"]
-        bc.value = ""
-        bc.fill  = fill(bg)
-        # thin darker accent strip
-        bc.border = Border(bottom=Side(style="medium",
-                                       color="00000030" if fg == WHITE else "FFFFFF40"))
-
-    # ── Status breakdown table (rows 9–onwards) ───────────────────────────────
-    ws.row_dimensions[9].height  = 20
-    ws.row_dimensions[10].height = 18
-
-    # Section label
     ws.merge_cells("B9:F9")
-    sl = ws["B9"]
-    sl.value     = "STATUS BREAKDOWN"
-    sl.font      = font(bold=True, size=9, colour=MID_BLUE)
-    sl.alignment = align("left", "bottom")
-    sl.border    = bottom_border(MID_BLUE)
+    ws["B9"].value     = "STATUS BREAKDOWN"
+    ws["B9"].font      = font(bold=True, size=9, colour=MID_BLUE)
+    ws["B9"].alignment = align("left", "bottom")
+    ws["B9"].border    = bottom_border(MID_BLUE)
 
-    # Table headers
-    tbl_headers = ["Status", "Count", "% of Total", "Health"]
-    tbl_cols    = ["B", "C", "D", "E"]
-    for col_l, hdr in zip(tbl_cols, tbl_headers):
-        c = ws[f"{col_l}10"]
+    for col_l, hdr in zip(["B", "C", "D", "E"], ["Status", "Count", "% of Total", "Health"]):
+        c           = ws[f"{col_l}10"]
         c.value     = hdr
         c.font      = font(bold=True, size=10, colour=WHITE)
         c.fill      = fill(NAVY)
         c.alignment = align("center", "center")
         c.border    = border(NAVY)
 
-    # One row per status category
     status_rows = [
-        ("Completed",    "Healthy ✅"),
-        ("Running",      "In Progress 🔄"),
-        ("Error",        "Needs Attention ❌"),
-        ("Aborted",      "Needs Attention ❌"),
-        ("Never Run",    "Not Started ⬜"),
-        ("Queued",       "Pending ⏳"),
-        ("Paused",       "Paused ⏸"),
+        ("Completed", "Healthy ✅"),
+        ("Running",   "In Progress 🔄"),
+        ("Error",     "Needs Attention ❌"),
+        ("Aborted",   "Needs Attention ❌"),
+        ("Never Run", "Not Started ⬜"),
+        ("Queued",    "Pending ⏳"),
+        ("Paused",    "Paused ⏸"),
+        ("Stopping",  "Stopping 🔄"),
+        ("Unknown",   "Unknown ❓"),
     ]
 
-    data_start_row = 11
     for i, (status_label, health) in enumerate(status_rows):
-        r     = data_start_row + i
-        count = status_counts.get(status_label, 0)
-        pct   = count / n if n > 0 else 0
-        bg_c  = STATUS_BG.get(status_label, "FFFFFF")
-        fg_c  = STATUS_FG.get(status_label, "000000")
-        row_bg = LIGHT_GREY if i % 2 == 0 else WHITE
+        row_num = 11 + i
+        count   = status_counts.get(status_label, 0)
+        pct     = count / n if n > 0 else 0
+        bg_c    = STATUS_BG.get(status_label, WHITE)
+        fg_c    = STATUS_FG.get(status_label, "000000")
+        row_bg  = LIGHT_GREY if i % 2 == 0 else WHITE
 
-        ws.row_dimensions[r].height = 18
+        ws.row_dimensions[row_num].height = 18
 
-        cells = {
-            "B": (status_label,         align("left",   "center"), font(bold=True, size=10, colour=fg_c),  fill(bg_c)),
-            "C": (count,                align("center", "center"), font(size=10),                          fill(row_bg)),
-            "D": (pct,                  align("center", "center"), font(size=10),                          fill(row_bg)),
+        cell_data = {
+            "B": (status_label,              align("left",   "center"), font(bold=True, size=10, colour=fg_c), fill(bg_c)),
+            "C": (count,                     align("center", "center"), font(size=10),                         fill(row_bg)),
+            "D": (pct,                       align("center", "center"), font(size=10),                         fill(row_bg)),
             "E": (health if count > 0 else "—",
-                                        align("center", "center"), font(size=10, colour=fg_c if count > 0 else MID_GREY),
-                                                                                                            fill(row_bg)),
+                                             align("center", "center"), font(size=10, colour=fg_c if count > 0 else MID_GREY),
+                                                                                                                fill(row_bg)),
         }
-        for col_l, (val, aln, fnt, fll) in cells.items():
-            c = ws[f"{col_l}{r}"]
+        for col_l, (val, aln, fnt, fll) in cell_data.items():
+            c           = ws[f"{col_l}{row_num}"]
             c.value     = val
             c.font      = fnt
             c.fill      = fll
@@ -398,11 +386,11 @@ def build_summary_sheet(ws, rows: list, generated_at: str) -> None:
             if col_l == "D":
                 c.number_format = "0.0%"
 
-    # ── Footer note ───────────────────────────────────────────────────────────
-    footer_row = data_start_row + len(status_rows) + 2
+    # ── Footer ────────────────────────────────────────────────────────────────
+    footer_row = 11 + len(status_rows) + 2
     ws.row_dimensions[footer_row].height = 14
     ws.merge_cells(f"B{footer_row}:F{footer_row}")
-    fc = ws[f"B{footer_row}"]
+    fc           = ws[f"B{footer_row}"]
     fc.value     = f"Full scan details available in '{EXTRACT_SHEET}' sheet  ·  Source: Tenable.io WAS v2 API"
     fc.font      = font(size=8, colour=MID_GREY, italic=True)
     fc.alignment = align("left", "center")
@@ -422,43 +410,37 @@ EXTRACT_COLS = [
 def build_extract_sheet(ws, rows: list) -> None:
     ws.sheet_view.showGridLines = True
 
-    # ── Header ────────────────────────────────────────────────────────────────
+    # Header row
     ws.row_dimensions[1].height = 28
-    for col_idx, (col_name, _) in enumerate(EXTRACT_COLS, start=1):
-        c = ws.cell(row=1, column=col_idx, value=col_name)
+    for col_idx, (col_name, width) in enumerate(EXTRACT_COLS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+        c           = ws.cell(row=1, column=col_idx, value=col_name)
         c.font      = font(bold=True, size=11, colour=WHITE)
         c.fill      = fill(NAVY)
         c.alignment = align("center", "center", wrap=True)
         c.border    = border(DARK_NAVY)
 
-    # Set column widths
-    for col_idx, (_, width) in enumerate(EXTRACT_COLS, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-    # ── Data rows ─────────────────────────────────────────────────────────────
+    # Data rows
     for row_idx, row in enumerate(rows, start=2):
         row_bg = LIGHT_BLUE if row_idx % 2 == 0 else WHITE
         status = row.get("Status", "")
         ws.row_dimensions[row_idx].height = 18
 
         for col_idx, (col_name, _) in enumerate(EXTRACT_COLS, start=1):
-            c = ws.cell(row=row_idx, column=col_idx, value=row.get(col_name, ""))
-            c.font      = font(size=10)
+            c           = ws.cell(row=row_idx, column=col_idx, value=row.get(col_name, ""))
             c.alignment = Alignment(vertical="top", wrap_text=True)
             c.border    = border()
 
             if col_name == "Status":
-                bg = STATUS_BG.get(status, WHITE)
-                fg = STATUS_FG.get(status, "000000")
-                c.fill = fill(bg)
-                c.font = font(size=10, bold=True, colour=fg)
+                c.font = font(size=10, bold=True, colour=STATUS_FG.get(status, "000000"))
+                c.fill = fill(STATUS_BG.get(status, WHITE))
             else:
+                c.font = font(size=10)
                 c.fill = fill(row_bg)
 
-    # ── Freeze + filter ───────────────────────────────────────────────────────
+    # Freeze header + auto-filter
     ws.freeze_panes = "A2"
-    last_col = get_column_letter(len(EXTRACT_COLS))
-    ws.auto_filter.ref = f"A1:{last_col}1"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(EXTRACT_COLS))}1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -466,7 +448,7 @@ def build_extract_sheet(ws, rows: list) -> None:
 def main():
     configs = fetch_all_was_configs()
     if not configs:
-        print("[!] No WAS scan configurations returned.")
+        print("[!] No WAS scan configurations returned. Verify your API keys and WAS licence.")
         sys.exit(0)
 
     print(f"\n[*] Processing {len(configs)} configs...\n")
@@ -480,9 +462,8 @@ def main():
 
         last_scan = fetch_last_scan(config_id)
         if last_scan:
-            raw_status = last_scan.get("status", "N/A")
-            status     = normalise_status(raw_status)
-            last_run   = fmt_ts(last_scan.get("started_at") or last_scan.get("finalized_at"))
+            status   = normalise_status(last_scan.get("status", ""))
+            last_run = fmt_ts(last_scan.get("started_at") or last_scan.get("finalized_at"))
         else:
             status   = "Never Run"
             last_run = "N/A"
@@ -499,17 +480,13 @@ def main():
         icon = {"Completed": "✅", "Running": "🔄", "Error": "❌", "Aborted": "❌"}.get(status, "⬜")
         print(f"  {icon} {name}  [{status}]  {last_run}")
 
-    # Build workbook
     generated_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    wb           = Workbook()
 
-    wb = Workbook()
-
-    # Sheet 1 — Executive Summary (rename default sheet)
-    ws_summary = wb.active
+    ws_summary       = wb.active
     ws_summary.title = "Executive Summary"
     build_summary_sheet(ws_summary, rows, generated_at)
 
-    # Sheet 2 — Full Extract
     ws_extract = wb.create_sheet(EXTRACT_SHEET)
     build_extract_sheet(ws_extract, rows)
 
