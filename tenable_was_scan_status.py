@@ -90,26 +90,72 @@ def get(endpoint: str, params: dict = None) -> dict:
 # TENABLE WAS API
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_all_was_configs() -> list:
+    """
+    POST /was/v2/configs/search
+    Paginates using 'offset' and 'limit' in the request body.
+    Response shape: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
+    """
     all_configs, offset, limit = [], 0, 100
     print("[*] Fetching WAS scan configurations...")
+
     while True:
-        data  = get("/was/v2/configs", params={"offset": offset, "limit": limit})
-        items = data.get("items", data.get("data", []))
+        payload = {"offset": offset, "limit": limit}
+        r = requests.post(
+            f"{BASE_URL}/was/v2/configs/search",
+            headers=HEADERS,
+            json=payload,
+            timeout=30,
+        )
+
+        if r.status_code == 401:
+            print("[ERROR] Authentication failed (HTTP 401). Verify your API keys.")
+            sys.exit(1)
+        if not r.ok:
+            print(f"[ERROR] POST /was/v2/configs/search returned HTTP {r.status_code}. Aborting.")
+            sys.exit(1)
+
+        data  = r.json()
+        items = data.get("items", [])
+        pagination = data.get("pagination", {})
+        total = pagination.get("total", len(all_configs) + len(items))
+
         if not items:
             break
+
         all_configs.extend(items)
-        total = data.get("total", data.get("pagination", {}).get("total", len(all_configs)))
         print(f"    {len(all_configs)} / {total} fetched")
+
         if len(all_configs) >= total or len(items) < limit:
             break
         offset += limit
+
     return all_configs
 
 
 def fetch_last_scan(config_id: str) -> dict:
-    data  = get(f"/was/v2/configs/{config_id}/scans",
-                params={"limit": 1, "sort": "started_at:desc"})
-    items = data.get("items", data.get("data", []))
+    """
+    POST /was/v2/scans/search
+    Filter by config_id, return only the most recent scan.
+    """
+    payload = {
+        "filter": {
+            "and": [
+                {"field": "config_id", "operator": "eq", "value": config_id}
+            ]
+        },
+        "sort": [{"field": "started_at", "order": "desc"}],
+        "limit": 1,
+        "offset": 0,
+    }
+    r = requests.post(
+        f"{BASE_URL}/was/v2/scans/search",
+        headers=HEADERS,
+        json=payload,
+        timeout=30,
+    )
+    if not r.ok:
+        return {}
+    items = r.json().get("items", [])
     return items[0] if items else {}
 
 # ─────────────────────────────────────────────────────────────────────────────
