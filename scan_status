@@ -5,18 +5,23 @@ Sheet 1 — Executive Summary  (KPI tiles + status breakdown table)
 Sheet 2 — Full Extract       (all scan details, filterable)
 
 Usage:
-export TENABLE_ACCESS_KEY=“your_key”
-export TENABLE_SECRET_KEY=“your_secret”
+Ensure a .env file exists in the same directory with:
+TENABLE_ACCESS_KEY=your_key
+TENABLE_SECRET_KEY=your_secret
+Then run:
 python tenable_was_scan_status.py
 
 Output: was_scan_status.xlsx
-Requires: pip install openpyxl requests
+Requires: pip install openpyxl requests python-dotenv
 “””
 
 import os
 import sys
 import requests
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env from the current working directory
 
 from openpyxl import Workbook
 from openpyxl.styles import (
@@ -38,10 +43,9 @@ OUTPUT_FILE = “was_scan_status.xlsx”
 
 if not ACCESS_KEY or not SECRET_KEY:
 print(”[ERROR] Missing API credentials.”)
-print(”  Set TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY as environment variables.”)
-print(”  Example:”)
-print(”    export TENABLE_ACCESS_KEY=‘your_access_key’”)
-print(”    export TENABLE_SECRET_KEY=‘your_secret_key’”)
+print(”  Ensure a .env file exists in the same directory containing:”)
+print(”    TENABLE_ACCESS_KEY=your_access_key”)
+print(”    TENABLE_SECRET_KEY=your_secret_key”)
 sys.exit(1)
 
 BASE_URL = “https://cloud.tenable.com”
