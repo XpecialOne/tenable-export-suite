@@ -129,6 +129,7 @@ def fetch_all_was_configs() -> list:
     POST /was/v2/configs/search
     Paginates using 'offset' and 'limit' in the request body.
     Response: { "items": [...], "pagination": { "total": N, "offset": N, "limit": N } }
+    Each item contains a nested "last_scan" object with status/timing — no per-scan API call needed.
 
     NOTE: The API may return fewer items than 'limit' on every page regardless
     of what is requested. Break conditions are therefore based solely on the
@@ -163,25 +164,6 @@ def fetch_all_was_configs() -> list:
     return all_configs
 
 
-def fetch_last_scan(config_id: str) -> dict:
-    """
-    POST /was/v2/scans/search
-    Returns the most recent scan execution for the given config_id.
-    """
-    if not config_id:
-        return {}
-
-    payload = {
-        "filter": {
-            "and": [{"field": "config_id", "operator": "eq", "value": config_id}]
-        },
-        "sort"  : [{"field": "started_at", "order": "desc"}],
-        "limit" : 1,
-        "offset": 0,
-    }
-    data  = post("/was/v2/scans/search", payload)
-    items = data.get("items", [])
-    return items[0] if items else {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITIES
@@ -202,17 +184,6 @@ def fmt_ts(ts) -> str:
         return str(ts)  # return raw value rather than crash
 
 
-def extract_urls(config: dict) -> str:
-    """Extract target URLs from a WAS scan config's settings block."""
-    s    = config.get("settings", {})
-    urls = s.get("urls") or s.get("target_urls") or [s.get("url") or s.get("start_url")]
-    flat = []
-    for item in (urls or []):
-        if isinstance(item, dict):
-            flat.append(item.get("url", ""))
-        elif item:
-            flat.append(str(item))
-    return "\n".join(filter(None, flat)) or "N/A"
 
 
 def normalise_status(status: str) -> str:
@@ -467,12 +438,12 @@ def main():
     rows = []
 
     for config in configs:
-        config_id = config.get("id", "")
+        config_id = config.get("config_id", "")
         name      = config.get("name", "Unknown")
-        notes     = config.get("description", config.get("notes", ""))
-        urls      = extract_urls(config)
+        notes     = config.get("description") or ""       # API returns null, not ""
+        target    = config.get("target") or "N/A"         # plain string at top level
 
-        last_scan = fetch_last_scan(config_id)
+        last_scan = config.get("last_scan") or {}         # already embedded in response
         if last_scan:
             status   = normalise_status(last_scan.get("status", ""))
             last_run = fmt_ts(last_scan.get("started_at") or last_scan.get("finalized_at"))
@@ -485,7 +456,7 @@ def main():
             "Last Run (UTC)": last_run,
             "Status"        : status,
             "Notes"         : notes,
-            "URLs"          : urls,
+            "URLs"          : target,
             "Config ID"     : config_id,
         })
 
